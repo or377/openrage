@@ -17,6 +17,8 @@ pub const PREVIEW_WIDTH: u32 = 640;
 pub const PREVIEW_HEIGHT: u32 = 360;
 /// Frames per second a movie that states no rate plays at.
 pub const PREVIEW_FPS: f64 = 30.0;
+pub const MIN_SPEED: f64 = 0.25;
+pub const MAX_SPEED: f64 = 4.0;
 const FRAME_BYTES: usize = (PREVIEW_WIDTH * PREVIEW_HEIGHT * 4) as usize;
 
 /// A Bink video document with its source bytes, header and buffered preview.
@@ -53,16 +55,16 @@ impl AppState {
     pub fn sound_the_movie(&mut self, doc: DocumentId) {
         let owed = self
             .video_preview(doc)
-            .map(|mut preview| (preview.take_cue(), preview.position));
+            .map(|mut preview| (preview.take_cue(), preview.position, preview.speed()));
         match owed {
-            Some((Some(SoundCue::Play(sound)), position)) => {
-                if let Err(why) = self.audio.play_movie(doc, &sound, position) {
+            Some((Some(SoundCue::Play(sound)), position, speed)) => {
+                if let Err(why) = self.audio.play_movie(doc, &sound, position, speed) {
                     if let Some(mut preview) = self.video_preview(doc) {
                         preview.set_sound_problem(why);
                     }
                 }
             }
-            Some((Some(SoundCue::Stop), _)) => self.audio.stop_movie(doc),
+            Some((Some(SoundCue::Stop), _, _)) => self.audio.stop_movie(doc),
             _ => {}
         }
     }
@@ -171,6 +173,7 @@ pub struct Preview {
     decoder: Option<Decoder>,
     frame: Option<Arc<[u8]>>,
     next_frame: u64,
+    speed: f64,
     buffering: bool,
     finished: bool,
     frames_since_seek: u64,
@@ -200,6 +203,7 @@ impl Default for Preview {
             decoder: None,
             frame: None,
             next_frame: 0,
+            speed: 1.0,
             buffering: false,
             finished: false,
             frames_since_seek: 0,
@@ -226,6 +230,27 @@ impl Preview {
         self.prepared = true;
         self.sound = decode_sound(bytes).map_or(Track::None, Track::Decoding);
         self.seek(bytes, 0.0);
+    }
+
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+
+    pub fn set_speed(&mut self, speed: f64) {
+        if !speed.is_finite() || speed <= 0.0 {
+            return;
+        }
+        let speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        if self.speed != speed {
+            self.speed = speed;
+            if let Some(decoder) = &mut self.decoder {
+                decoder.set_rate(self.fps, speed);
+            }
+            self.clock = self.position;
+            if self.playing {
+                self.cue = Some(!self.buffering);
+            }
+        }
     }
 
     /// The fraction of the starting reserve decoded, while that reserve is still filling.
@@ -300,6 +325,7 @@ impl Preview {
                 first,
                 total,
                 self.fps,
+                self.speed,
             ));
         }
         self.route = Some(ROUTE);
@@ -358,7 +384,7 @@ impl Preview {
         true
     }
 
-    /// Fill the reserve, advance the clock and hold both tracks during a refill.
+    /// Fill the reserve, advance at the chosen speed and hold both tracks during a refill.
     pub fn tick(&mut self, dt: f64) {
         if let Some(decoder) = &mut self.decoder {
             if let Err(why) = decoder.pump() {
@@ -390,7 +416,7 @@ impl Preview {
             return;
         }
         if dt.is_finite() {
-            self.clock += dt.max(0.0);
+            self.clock += dt.max(0.0) * self.speed;
         }
         while self.next_at <= self.clock {
             if self.show_next() {
@@ -695,6 +721,27 @@ mod tests {
     }
 
     #[test]
+    fn playback_defaults_to_one_and_the_selected_speed_scales_time() {
+        assert_eq!(Preview::default().speed(), 1.0);
+        for (speed, frame) in [(0.25, 0), (0.5, 1), (1.0, 3), (2.0, 6), (4.0, 11)] {
+            let movie = bink2_head(12);
+            let mut preview = preview_of_shades(12, None);
+            preview.seek(&movie, 0.0);
+            assert!(preview.wait_for_buffer(Duration::from_secs(5)));
+            preview.set_speed(speed);
+            preview.play(&movie);
+            preview.tick(0.1);
+            assert_eq!(preview.frame().map(|p| p[0]), Some(frame));
+            assert_eq!(preview.position, f64::from(frame) / 30.0);
+            preview.pause();
+            preview.tick(1.0);
+            assert_eq!(preview.position, f64::from(frame) / 30.0);
+            preview.seek(&movie, 0.0);
+            assert_eq!(preview.speed(), speed);
+        }
+    }
+
+    #[test]
     fn a_cached_short_movie_seeks_and_replays_without_decoding_again() {
         let movie = bink2_head(12);
         let mut preview = preview_of_shades(12, None);
@@ -770,7 +817,13 @@ mod tests {
         preview.tick(3.0);
         assert_eq!(preview.position, 1.0);
         assert!(preview.buffering);
-        assert!(matches!(preview.take_cue(), Some(SoundCue::Stop)));
+        for speed in [2.0, 1.0] {
+            preview.set_speed(speed);
+            assert!(
+                matches!(preview.take_cue(), Some(SoundCue::Stop)),
+                "a speed change while refilling must still silence the sound"
+            );
+        }
         preview.tick(10.0);
         assert_eq!(preview.position, 1.0, "the refill holds the clock");
         for _ in 0..30 {
@@ -944,6 +997,40 @@ mod tests {
             .expect("the preview listens");
         assert!(broken.take_cue().is_none());
         assert_eq!(broken.sound_problem(), Some("a block is cut short"));
+    }
+
+    #[test]
+    fn movie_sound_follows_the_rate_and_keeps_its_place_when_the_rate_changes() {
+        let sink = crate::audio::NullSink::default();
+        let heard = Arc::clone(&sink.heard);
+        let mut audio = crate::audio::AudioOut::new(Box::new(sink));
+        let sound = two_seconds_of_stereo_at_4_hz();
+        for (speed, rate) in [(0.5, 2), (1.0, 4), (2.0, 8)] {
+            audio
+                .play_movie(7, &sound, 0.5, speed)
+                .expect("sound plays");
+            let played = heard.lock().expect("the sound heard");
+            assert_eq!(
+                played.as_slice(),
+                &[(rate, 2, (4..16).collect::<Vec<i16>>())]
+            );
+        }
+        let (mut preview, movie) = preview_with_sound(Track::Ready(Arc::new(sound)));
+        assert!(preview.wait_for_buffer(Duration::from_secs(5)));
+        preview.play(&movie);
+        assert!(matches!(preview.take_cue(), Some(SoundCue::Play(_))));
+        preview.tick(0.1);
+        let position = preview.position;
+        preview.set_speed(2.0);
+        assert_eq!(preview.position, position);
+        assert!(matches!(preview.take_cue(), Some(SoundCue::Play(_))));
+        preview.pause();
+        assert!(matches!(preview.take_cue(), Some(SoundCue::Stop)));
+        preview.set_speed(0.5);
+        assert!(
+            preview.take_cue().is_none(),
+            "a paused speed change never starts sound"
+        );
     }
 
     #[test]

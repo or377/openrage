@@ -26,25 +26,36 @@ pub(super) struct Decoder {
     ended: bool,
 }
 
-fn capacity(frames: u64, fps: f64) -> (usize, bool) {
+fn capacity(frames: u64, fps: f64, rate: f64) -> (usize, bool) {
     let retain = frames > 0 && frames <= BUFFER_FRAMES as u64;
     let capacity = if retain {
         frames as usize
     } else {
-        ((fps * AHEAD_SECONDS).ceil() as usize).clamp(2, BUFFER_FRAMES)
+        reserve_capacity(fps, rate)
     };
     (capacity, retain)
 }
 
+fn reserve_capacity(fps: f64, rate: f64) -> usize {
+    ((fps * rate * AHEAD_SECONDS).ceil() as usize).clamp(2, BUFFER_FRAMES)
+}
+
 impl Decoder {
+    pub(super) fn set_rate(&mut self, fps: f64, rate: f64) {
+        if !self.retain {
+            self.capacity = reserve_capacity(fps, rate);
+        }
+    }
+
     pub(super) fn start(
         bytes: Arc<[u8]>,
         mut stream: Box<dyn VideoStream>,
         first: u64,
         total: u64,
         fps: f64,
+        rate: f64,
     ) -> Self {
-        let (capacity, retain) = capacity(total, fps);
+        let (capacity, retain) = capacity(total, fps, rate);
         let first = if retain { 0 } else { first };
         let (sender, receiver) = sync_channel(2);
         std::thread::spawn(move || {
@@ -164,18 +175,48 @@ mod tests {
 
     #[test]
     fn short_movies_fit_whole_and_long_or_fast_movies_stay_bounded() {
-        assert_eq!(capacity(115, 30.0), (115, true));
+        assert_eq!(capacity(115, 30.0, 1.0), (115, true));
         assert_eq!(
-            capacity(900, 30.0),
+            capacity(900, 30.0, 1.0),
             (30, false),
             "one second at normal speed"
         );
         for (frames, fps) in [(900, 30.0), (u64::MAX, 240.0), (200, 1.0), (0, 30.0)] {
-            let (count, retain) = capacity(frames, fps);
+            let (count, retain) = capacity(frames, fps, 1.0);
             assert!(!retain);
             assert!(count >= 2);
             assert!((count + 4) * FRAME_BYTES <= BUFFER_BYTES);
         }
+    }
+
+    #[test]
+    fn the_reserve_follows_the_selected_rate_without_throwing_away_decoded_frames() {
+        for (rate, wanted) in [(0.25, 8), (0.5, 15), (1.0, 30), (2.0, 60), (4.0, 120)] {
+            assert_eq!(capacity(900, 30.0, rate), (wanted, false));
+            assert_eq!(capacity(115, 30.0, rate), (115, true));
+        }
+        let mut decoder = Decoder {
+            bytes: Arc::from(&b"movie"[..]),
+            receiver: None,
+            pictures: (0..60).map(|v| Arc::from(vec![v])).collect(),
+            first: 0,
+            total: 900,
+            capacity: 60,
+            retain: false,
+            ended: false,
+        };
+        decoder.set_rate(30.0, 0.5);
+        assert_eq!(decoder.capacity, 15);
+        assert_eq!(
+            decoder.pictures.len(),
+            60,
+            "a rate change loses no prepared picture"
+        );
+        for at in 0..60 {
+            assert_eq!(decoder.frame(at).as_deref(), Some(&[at as u8][..]));
+        }
+        decoder.set_rate(30.0, 2.0);
+        assert_eq!(decoder.capacity, 60);
     }
 
     #[test]

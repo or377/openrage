@@ -72,16 +72,31 @@ fn draw_preview(
             preview.seek(bytes, at);
         }
     });
-    if let Some(progress) = preview.buffer_progress() {
-        ui.add(
-            egui::ProgressBar::new(progress)
-                .desired_width(180.0)
-                .text(tr!(
-                    "Preparing video… {percent}%",
-                    percent = format!("{:.0}", progress * 100.0)
-                )),
-        );
-    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(tr!("Speed"));
+        let mut speed = preview.speed();
+        egui::ComboBox::from_id_salt("bik_speed")
+            .selected_text(format!("×{speed}"))
+            .width(72.0)
+            .show_ui(ui, |ui| {
+                for value in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0] {
+                    ui.selectable_value(&mut speed, value, format!("×{value}"));
+                }
+            })
+            .response
+            .on_hover_text(tr!("Playback speed multiplier"));
+        preview.set_speed(speed);
+        if let Some(progress) = preview.buffer_progress() {
+            ui.add(
+                egui::ProgressBar::new(progress)
+                    .desired_width(180.0)
+                    .text(tr!(
+                        "Preparing video… {percent}%",
+                        percent = format!("{:.0}", progress * 100.0)
+                    )),
+            );
+        }
+    });
     ui.label(
         egui::RichText::new(preview.sound_note())
             .small()

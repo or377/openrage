@@ -207,16 +207,21 @@ fn a_bk2_from_the_archive_device_plays_from_its_complete_memory_cache() {
     assert_eq!(preview.position, last);
     preview.seek(&bik.bytes, 0.0);
     assert_eq!(preview.frame(), Some(first.as_slice()));
-    preview.play(&bik.bytes);
-    for _ in 0..(duration * 120.0).ceil() as usize + 2 {
-        preview.tick(1.0 / 120.0);
-        assert_eq!(
-            preview.buffer_progress(),
-            None,
-            "the complete cache never stalls"
-        );
+    assert_eq!(preview.speed(), 1.0);
+    for speed in [0.25, 0.5, 1.0, 2.0, 4.0] {
+        preview.seek(&bik.bytes, 0.0);
+        preview.set_speed(speed);
+        preview.play(&bik.bytes);
+        for _ in 0..(duration * 120.0 / speed).ceil() as usize + 2 {
+            preview.tick(1.0 / 120.0);
+            assert_eq!(
+                preview.buffer_progress(),
+                None,
+                "the complete cache never stalls"
+            );
+        }
+        assert!(!preview.playing);
+        assert_eq!(preview.position, last);
+        assert_eq!(preview.problem(), None);
     }
-    assert!(!preview.playing);
-    assert_eq!(preview.position, last);
-    assert_eq!(preview.problem(), None);
 }

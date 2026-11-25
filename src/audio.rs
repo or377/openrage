@@ -308,15 +308,18 @@ impl AudioOut {
         self.playing = None;
     }
 
-    /// Plays a movie's sound from `seconds` in, replacing whatever plays.
+    /// Plays a movie's sound from `seconds` at `speed`, replacing whatever plays.
     pub fn play_movie(
         &mut self,
         doc: DocumentId,
         sound: &crate::video::Sound,
         seconds: f64,
+        speed: f64,
     ) -> Result<(), String> {
-        self.sink
-            .play(sound.rate, sound.channels, sound.from(seconds))?;
+        let rate = (f64::from(sound.rate) * speed)
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        self.sink.play(rate, sound.channels, sound.from(seconds))?;
         self.playing = Some((doc, MOVIE_SOUND));
         Ok(())
     }
